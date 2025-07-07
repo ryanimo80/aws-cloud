@@ -1,0 +1,21 @@
+# Base requirements
+-r ../shared/requirements.txt
+
+# Order Service specific
+gunicorn==21.2.0
+django-fsm==2.8.1
+django-model-utils==4.3.1
+
+# Payment processing
+stripe==7.8.0
+paypal-rest-sdk==1.13.3
+
+# Inventory management
+django-simple-history==3.4.0
+
+# PDF generation
+reportlab==4.0.7
+weasyprint==60.2
+
+# Email templates
+django-templated-mail==1.1.1 

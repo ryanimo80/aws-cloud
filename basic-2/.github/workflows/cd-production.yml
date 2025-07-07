@@ -1,0 +1,636 @@
+name: CD - Deploy to Production
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - hotfix
+      version:
+        description: 'Version to deploy (leave empty for latest)'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: django-microservices
+
+jobs:
+  # Job 1: Pre-deployment validation
+  pre-deployment:
+    name: Pre-deployment Validation
+    runs-on: ubuntu-latest
+    environment: 
+      name: production
+      url: ${{ steps.deploy-info.outputs.url }}
+    outputs:
+      deploy_version: ${{ steps.version.outputs.version }}
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+      environment: ${{ steps.env.outputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          else
+            echo "environment=production" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Generate deployment version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="${GITHUB_SHA:0:8}-$(date +%Y%m%d-%H%M%S)"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Deployment version: $VERSION"
+          
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Validate deployment readiness
+        id: check
+        run: |
+          # Check if all required images exist in ECR
+          services=("api-gateway" "user-service" "product-service" "order-service" "notification-service")
+          missing_images=()
+          
+          for service in "${services[@]}"; do
+            if ! aws ecr describe-images \
+              --repository-name "${{ env.PROJECT_NAME }}-$service" \
+              --image-ids imageTag="${{ github.sha }}" \
+              --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+              missing_images+=("$service")
+            fi
+          done
+          
+          if [ ${#missing_images[@]} -gt 0 ]; then
+            echo "❌ Missing images for services: ${missing_images[*]}"
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+          else
+            echo "✅ All required images are available"
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Set deployment URL
+        id: deploy-info
+        run: |
+          cd terraform
+          terraform init -backend=false
+          ALB_DNS=$(terraform output -raw load_balancer_dns || echo "")
+          if [ -n "$ALB_DNS" ]; then
+            echo "url=http://$ALB_DNS" >> $GITHUB_OUTPUT
+          else
+            echo "url=https://your-domain.com" >> $GITHUB_OUTPUT
+          fi
+          cd ..
+
+  # Job 2: Security scan before production
+  security-scan:
+    name: Pre-production Security Scan
+    runs-on: ubuntu-latest
+    needs: [pre-deployment]
+    if: needs.pre-deployment.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        
+      - name: Scan production images
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          services=("api-gateway" "user-service" "product-service" "order-service" "notification-service")
+          
+          for service in "${services[@]}"; do
+            echo "Scanning $service image..."
+            
+            # Scan with Trivy
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+              aquasec/trivy:latest image --exit-code 1 --severity HIGH,CRITICAL \
+              $ECR_REGISTRY/${{ env.PROJECT_NAME }}-$service:${{ github.sha }}
+          done
+          
+          echo "✅ All images passed security scan"
+
+  # Job 3: Blue-Green Deployment Preparation
+  blue-green-prep:
+    name: Blue-Green Deployment Prep
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, security-scan]
+    if: needs.pre-deployment.outputs.should_deploy == 'true'
+    outputs:
+      current_version: ${{ steps.current.outputs.version }}
+      target_group_blue: ${{ steps.target-groups.outputs.blue }}
+      target_group_green: ${{ steps.target-groups.outputs.green }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Get current production version
+        id: current
+        run: |
+          # Get current task definition version
+          CURRENT_VERSION=$(aws ecs describe-services \
+            --cluster ${{ env.PROJECT_NAME }}-cluster \
+            --services ${{ env.PROJECT_NAME }}-api-gateway \
+            --query 'services[0].taskDefinition' \
+            --output text | cut -d'/' -f2 | cut -d':' -f2)
+          
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "Current production version: $CURRENT_VERSION"
+          
+      - name: Setup target groups for blue-green
+        id: target-groups
+        run: |
+          # This is a simplified version - in real scenarios you'd have separate target groups
+          # For now, we'll use the existing target groups
+          echo "blue=current" >> $GITHUB_OUTPUT
+          echo "green=new" >> $GITHUB_OUTPUT
+
+  # Job 4: Database Migration with Backup
+  database-migration:
+    name: Database Migration (with Backup)
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, blue-green-prep]
+    if: needs.pre-deployment.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          pip install -r microservices/shared/requirements.txt
+          pip install psycopg2-binary
+          
+      - name: Create database backup
+        run: |
+          # Get database endpoint
+          cd terraform
+          terraform init -backend=false
+          DB_ENDPOINT=$(terraform output -raw database_endpoint || echo "")
+          cd ..
+          
+          if [ -n "$DB_ENDPOINT" ]; then
+            echo "Creating database backup..."
+            
+            # Create backup
+            BACKUP_FILE="backup-$(date +%Y%m%d-%H%M%S).sql"
+            
+            PGPASSWORD="${{ secrets.DB_PASSWORD }}" pg_dump \
+              -h $DB_ENDPOINT \
+              -U ${{ secrets.DB_USERNAME }} \
+              -d ${{ secrets.DB_NAME }} \
+              -f $BACKUP_FILE
+            
+            # Store backup in S3
+            aws s3 cp $BACKUP_FILE s3://${{ secrets.BACKUP_S3_BUCKET }}/database-backups/
+            
+            echo "✅ Database backup created: $BACKUP_FILE"
+          else
+            echo "Database endpoint not found"
+            exit 1
+          fi
+          
+      - name: Run database migrations
+        run: |
+          # Get database endpoint
+          cd terraform
+          terraform init -backend=false
+          DB_ENDPOINT=$(terraform output -raw database_endpoint || echo "")
+          cd ..
+          
+          if [ -n "$DB_ENDPOINT" ]; then
+            echo "Running database migrations..."
+            
+            # Run migrations for each service
+            for service in api-gateway user-service product-service order-service notification-service; do
+              echo "Running migrations for $service..."
+              cd microservices/$service
+              
+              # Set environment variables
+              export DATABASE_URL="postgresql://${{ secrets.DB_USERNAME }}:${{ secrets.DB_PASSWORD }}@$DB_ENDPOINT/${{ secrets.DB_NAME }}"
+              export DJANGO_SETTINGS_MODULE="settings"
+              
+              # Run migrations
+              python manage.py migrate --no-input
+              
+              cd ../..
+            done
+            
+            echo "✅ Database migrations completed"
+          else
+            echo "Database endpoint not found"
+            exit 1
+          fi
+
+  # Job 5: Deploy to Production (Blue-Green)
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, blue-green-prep, database-migration]
+    if: needs.pre-deployment.outputs.should_deploy == 'true'
+    strategy:
+      matrix:
+        service: [api-gateway, user-service, product-service, order-service, notification-service]
+      fail-fast: false
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Deploy ${{ matrix.service }} to production
+        run: |
+          echo "Deploying ${{ matrix.service }} to production..."
+          
+          # Get current task definition
+          TASK_DEFINITION=$(aws ecs describe-task-definition \
+            --task-definition ${{ env.PROJECT_NAME }}-${{ matrix.service }} \
+            --query 'taskDefinition' \
+            --output json)
+          
+          # Update image URI with production tag
+          NEW_IMAGE="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.PROJECT_NAME }}-${{ matrix.service }}:${{ github.sha }}"
+          
+          # Update the task definition
+          UPDATED_TASK_DEFINITION=$(echo $TASK_DEFINITION | jq --arg IMAGE "$NEW_IMAGE" '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresCompatibilities, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)')
+          
+          # Register new task definition
+          NEW_TASK_DEF=$(aws ecs register-task-definition \
+            --family ${{ env.PROJECT_NAME }}-${{ matrix.service }} \
+            --cli-input-json "$UPDATED_TASK_DEFINITION")
+          
+          # Update service with new task definition
+          aws ecs update-service \
+            --cluster ${{ env.PROJECT_NAME }}-cluster \
+            --service ${{ env.PROJECT_NAME }}-${{ matrix.service }} \
+            --task-definition ${{ env.PROJECT_NAME }}-${{ matrix.service }} \
+            --force-new-deployment
+          
+          echo "✅ ${{ matrix.service }} production deployment initiated"
+
+  # Job 6: Production Deployment Verification
+  production-verification:
+    name: Production Verification
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, deploy-production]
+    if: needs.pre-deployment.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Wait for production deployment
+        run: |
+          services=("api-gateway" "user-service" "product-service" "order-service" "notification-service")
+          
+          for service in "${services[@]}"; do
+            echo "Waiting for $service to stabilize in production..."
+            
+            aws ecs wait services-stable \
+              --cluster ${{ env.PROJECT_NAME }}-cluster \
+              --services ${{ env.PROJECT_NAME }}-$service \
+              --region ${{ env.AWS_REGION }} \
+              --cli-read-timeout 0 \
+              --cli-connect-timeout 120
+              
+            if [ $? -eq 0 ]; then
+              echo "✅ $service is stable in production"
+            else
+              echo "❌ $service failed to stabilize in production"
+              exit 1
+            fi
+          done
+          
+      - name: Production health check
+        run: |
+          # Get production ALB DNS
+          cd terraform
+          terraform init -backend=false
+          ALB_DNS=$(terraform output -raw load_balancer_dns || echo "")
+          cd ..
+          
+          if [ -n "$ALB_DNS" ]; then
+            echo "Running production health checks..."
+            
+            # Wait for ALB to register new targets
+            sleep 60
+            
+            # Test each service endpoint
+            services=("" "users" "products" "orders" "notifications")
+            
+            for service in "${services[@]}"; do
+              if [ -z "$service" ]; then
+                endpoint="http://$ALB_DNS/health/"
+                name="API Gateway"
+              else
+                endpoint="http://$ALB_DNS/$service/health/"
+                name="$service Service"
+              fi
+              
+              echo "Testing $name: $endpoint"
+              
+              # Retry health check multiple times
+              for i in {1..5}; do
+                response=$(curl -s -o /dev/null -w "%{http_code}" "$endpoint" || echo "000")
+                
+                if [ "$response" = "200" ]; then
+                  echo "✅ $name is healthy (attempt $i)"
+                  break
+                elif [ $i -eq 5 ]; then
+                  echo "❌ $name failed health check after 5 attempts (last response: $response)"
+                  exit 1
+                else
+                  echo "⏳ $name health check failed (attempt $i), retrying..."
+                  sleep 30
+                fi
+              done
+            done
+            
+            echo "🎉 All production health checks passed!"
+          else
+            echo "Production ALB DNS not found"
+            exit 1
+          fi
+
+  # Job 7: Production Smoke Tests
+  production-smoke-tests:
+    name: Production Smoke Tests
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, production-verification]
+    if: needs.pre-deployment.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          pip install requests pytest pytest-html
+          
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Run production smoke tests
+        run: |
+          # Get production ALB DNS
+          cd terraform
+          terraform init -backend=false
+          ALB_DNS=$(terraform output -raw load_balancer_dns || echo "")
+          cd ..
+          
+          if [ -n "$ALB_DNS" ]; then
+            echo "Running production smoke tests..."
+            
+            # Set environment variable for tests
+            export BASE_URL="http://$ALB_DNS"
+            export ENVIRONMENT="production"
+            
+            # Run critical path smoke tests
+            python -m pytest tests/smoke/ -v \
+              --html=production-smoke-test-report.html \
+              --self-contained-html \
+              -k "critical"
+            
+            echo "🎉 Production smoke tests completed!"
+          else
+            echo "Production ALB DNS not found"
+            exit 1
+          fi
+          
+      - name: Upload smoke test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: production-smoke-test-results-${{ needs.pre-deployment.outputs.deploy_version }}
+          path: production-smoke-test-report.html
+
+  # Job 8: Rollback capability
+  setup-rollback:
+    name: Setup Rollback
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, blue-green-prep, production-smoke-tests]
+    if: needs.pre-deployment.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Store rollback information
+        run: |
+          # Store rollback information in S3
+          cat > rollback-info.json << EOF
+          {
+            "deployment_id": "${{ github.run_id }}",
+            "deployment_version": "${{ needs.pre-deployment.outputs.deploy_version }}",
+            "previous_version": "${{ needs.blue-green-prep.outputs.current_version }}",
+            "commit_sha": "${{ github.sha }}",
+            "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "deployed_by": "${{ github.actor }}",
+            "services": [
+              "api-gateway",
+              "user-service", 
+              "product-service",
+              "order-service",
+              "notification-service"
+            ]
+          }
+          EOF
+          
+          # Upload to S3
+          aws s3 cp rollback-info.json s3://${{ secrets.BACKUP_S3_BUCKET }}/rollback-info/production-latest.json
+          aws s3 cp rollback-info.json s3://${{ secrets.BACKUP_S3_BUCKET }}/rollback-info/production-${{ github.run_id }}.json
+          
+          echo "✅ Rollback information stored"
+
+  # Job 9: Production Deployment Notification
+  production-notification:
+    name: Production Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, production-verification, production-smoke-tests, setup-rollback]
+    if: always()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Generate production deployment report
+        run: |
+          # Get production ALB DNS
+          cd terraform
+          terraform init -backend=false
+          ALB_DNS=$(terraform output -raw load_balancer_dns || echo "")
+          cd ..
+          
+          echo "## 🚀 Production Deployment Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Deployment Status: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Deployment Details:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ needs.pre-deployment.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.pre-deployment.outputs.deploy_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployed by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deploy time**: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployment ID**: ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "$ALB_DNS" ]; then
+            echo "### 🌐 Production URLs:" >> $GITHUB_STEP_SUMMARY
+            echo "- **Load Balancer**: http://$ALB_DNS" >> $GITHUB_STEP_SUMMARY
+            echo "- **API Gateway**: http://$ALB_DNS/" >> $GITHUB_STEP_SUMMARY
+            echo "- **User Service**: http://$ALB_DNS/users/" >> $GITHUB_STEP_SUMMARY
+            echo "- **Product Service**: http://$ALB_DNS/products/" >> $GITHUB_STEP_SUMMARY
+            echo "- **Order Service**: http://$ALB_DNS/orders/" >> $GITHUB_STEP_SUMMARY
+            echo "- **Notification Service**: http://$ALB_DNS/notifications/" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "### 📊 Job Results:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Security Scan**: ${{ needs.security-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Database Migration**: ${{ needs.database-migration.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service Deployment**: ${{ needs.deploy-production.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Production Verification**: ${{ needs.production-verification.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Smoke Tests**: ${{ needs.production-smoke-tests.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Rollback Setup**: ${{ needs.setup-rollback.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔄 Rollback Information:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Rollback Command**: \`gh workflow run rollback.yml -f deployment_id=${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Previous Version**: ${{ needs.blue-green-prep.outputs.current_version }}" >> $GITHUB_STEP_SUMMARY
+          
+      - name: Post to Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#production-deployments'
+          title: '🚀 Production Deployment'
+          message: |
+            *Production Deployment ${{ job.status }}*
+            Version: ${{ needs.pre-deployment.outputs.deploy_version }}
+            Commit: ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+            Actor: ${{ github.actor }}
+            Deployment ID: ${{ github.run_id }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          
+      - name: Create GitHub Release
+        if: success() && github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Production Release ${{ github.ref_name }}
+          body: |
+            ## 🚀 Production Deployment
+            
+            **Version**: ${{ needs.pre-deployment.outputs.deploy_version }}
+            **Commit**: ${{ github.sha }}
+            **Deployed by**: ${{ github.actor }}
+            **Deploy time**: $(date)
+            
+            ### Services Deployed:
+            - API Gateway
+            - User Service
+            - Product Service
+            - Order Service
+            - Notification Service
+            
+            ### URLs:
+            - Production: http://your-production-domain.com
+            
+            ### Rollback:
+            If needed, run: `gh workflow run rollback.yml -f deployment_id=${{ github.run_id }}`
+          draft: false
+          prerelease: false 

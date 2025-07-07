@@ -1,0 +1,441 @@
+name: CD - Deploy to Staging
+
+on:
+  push:
+    branches: [ develop ]
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deployment even if tests fail'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: django-microservices
+  ENVIRONMENT: staging
+
+jobs:
+  # Job 1: Pre-deployment checks
+  pre-deployment:
+    name: Pre-deployment Checks
+    runs-on: ubuntu-latest
+    outputs:
+      deploy_version: ${{ steps.version.outputs.version }}
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Generate deployment version
+        id: version
+        run: |
+          VERSION="${GITHUB_SHA:0:8}-$(date +%Y%m%d-%H%M%S)"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Deployment version: $VERSION"
+          
+      - name: Check if deployment should proceed
+        id: check
+        run: |
+          # Check if CI passed on this commit
+          CI_STATUS=$(gh api repos/${{ github.repository }}/commits/${{ github.sha }}/check-runs --jq '.check_runs[] | select(.name == "CI - Build, Test & Security Scan") | .conclusion')
+          
+          if [ "$CI_STATUS" = "success" ] || [ "${{ github.event.inputs.force_deploy }}" = "true" ]; then
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "✅ Deployment approved"
+          else
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+            echo "❌ CI checks failed or not completed"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Job 2: Database Migration
+  database-migration:
+    name: Database Migration
+    runs-on: ubuntu-latest
+    needs: [pre-deployment]
+    if: needs.pre-deployment.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          pip install -r microservices/shared/requirements.txt
+          pip install psycopg2-binary
+          
+      - name: Run database migrations
+        run: |
+          # Get database endpoint from Terraform
+          cd terraform
+          terraform init -backend=false
+          DB_ENDPOINT=$(terraform output -raw database_endpoint || echo "")
+          cd ..
+          
+          if [ -n "$DB_ENDPOINT" ]; then
+            echo "Running migrations against: $DB_ENDPOINT"
+            
+            # Run migrations for each service
+            for service in api-gateway user-service product-service order-service notification-service; do
+              echo "Running migrations for $service..."
+              cd microservices/$service
+              
+              # Set environment variables
+              export DATABASE_URL="postgresql://${{ secrets.DB_USERNAME }}:${{ secrets.DB_PASSWORD }}@$DB_ENDPOINT/${{ secrets.DB_NAME }}"
+              export DJANGO_SETTINGS_MODULE="settings"
+              
+              # Run migrations
+              python manage.py migrate --no-input
+              
+              cd ../..
+            done
+          else
+            echo "Database endpoint not found, skipping migrations"
+          fi
+
+  # Job 3: Deploy Infrastructure Updates
+  deploy-infrastructure:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, database-migration]
+    if: needs.pre-deployment.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init
+          
+      - name: Terraform Plan
+        run: |
+          cd terraform
+          terraform plan -out=tfplan -var="environment=${{ env.ENVIRONMENT }}"
+          
+      - name: Terraform Apply
+        run: |
+          cd terraform
+          terraform apply tfplan
+
+  # Job 4: Deploy Services
+  deploy-services:
+    name: Deploy ECS Services
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, database-migration, deploy-infrastructure]
+    if: needs.pre-deployment.outputs.should_deploy == 'true'
+    strategy:
+      matrix:
+        service: [api-gateway, user-service, product-service, order-service, notification-service]
+      fail-fast: false
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Update ECS Service
+        run: |
+          # Get current task definition
+          TASK_DEFINITION=$(aws ecs describe-task-definition \
+            --task-definition ${{ env.PROJECT_NAME }}-${{ matrix.service }} \
+            --query 'taskDefinition' \
+            --output json)
+          
+          # Update image URI with new version
+          NEW_IMAGE="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.PROJECT_NAME }}-${{ matrix.service }}:${{ github.sha }}"
+          
+          # Update the task definition
+          UPDATED_TASK_DEFINITION=$(echo $TASK_DEFINITION | jq --arg IMAGE "$NEW_IMAGE" '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresCompatibilities, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)')
+          
+          # Register new task definition
+          aws ecs register-task-definition \
+            --family ${{ env.PROJECT_NAME }}-${{ matrix.service }} \
+            --cli-input-json "$UPDATED_TASK_DEFINITION"
+          
+          # Update service
+          aws ecs update-service \
+            --cluster ${{ env.PROJECT_NAME }}-cluster \
+            --service ${{ env.PROJECT_NAME }}-${{ matrix.service }} \
+            --task-definition ${{ env.PROJECT_NAME }}-${{ matrix.service }} \
+            --force-new-deployment
+          
+          echo "✅ ${{ matrix.service }} deployment initiated"
+
+  # Job 5: Wait for Deployment
+  wait-for-deployment:
+    name: Wait for Deployment
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, deploy-services]
+    if: needs.pre-deployment.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Wait for services to stabilize
+        run: |
+          services=("api-gateway" "user-service" "product-service" "order-service" "notification-service")
+          
+          for service in "${services[@]}"; do
+            echo "Waiting for $service to stabilize..."
+            
+            aws ecs wait services-stable \
+              --cluster ${{ env.PROJECT_NAME }}-cluster \
+              --services ${{ env.PROJECT_NAME }}-$service \
+              --region ${{ env.AWS_REGION }} \
+              --cli-read-timeout 0 \
+              --cli-connect-timeout 60
+              
+            if [ $? -eq 0 ]; then
+              echo "✅ $service is stable"
+            else
+              echo "❌ $service failed to stabilize"
+              exit 1
+            fi
+          done
+          
+          echo "🎉 All services are stable!"
+
+  # Job 6: Health Check
+  health-check:
+    name: Post-deployment Health Check
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, wait-for-deployment]
+    if: needs.pre-deployment.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          pip install requests pytest pytest-html
+          
+      - name: Run health checks
+        run: |
+          # Get ALB DNS
+          cd terraform
+          terraform init -backend=false
+          ALB_DNS=$(terraform output -raw load_balancer_dns || echo "")
+          cd ..
+          
+          if [ -n "$ALB_DNS" ]; then
+            echo "Running health checks against: http://$ALB_DNS"
+            
+            # Test each service endpoint
+            services=("" "users" "products" "orders" "notifications")
+            
+            for service in "${services[@]}"; do
+              if [ -z "$service" ]; then
+                endpoint="http://$ALB_DNS/health/"
+                name="API Gateway"
+              else
+                endpoint="http://$ALB_DNS/$service/health/"
+                name="$service Service"
+              fi
+              
+              echo "Testing $name: $endpoint"
+              
+              response=$(curl -s -o /dev/null -w "%{http_code}" "$endpoint" || echo "000")
+              
+              if [ "$response" = "200" ]; then
+                echo "✅ $name is healthy"
+              else
+                echo "❌ $name returned $response"
+                exit 1
+              fi
+            done
+            
+            echo "🎉 All health checks passed!"
+          else
+            echo "ALB DNS not found, skipping health checks"
+          fi
+
+  # Job 7: Smoke Tests
+  smoke-tests:
+    name: Smoke Tests
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, health-check]
+    if: needs.pre-deployment.outputs.should_deploy == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          pip install requests pytest pytest-html
+          
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Run smoke tests
+        run: |
+          # Get ALB DNS
+          cd terraform
+          terraform init -backend=false
+          ALB_DNS=$(terraform output -raw load_balancer_dns || echo "")
+          cd ..
+          
+          if [ -n "$ALB_DNS" ]; then
+            echo "Running smoke tests against: http://$ALB_DNS"
+            
+            # Set environment variable for tests
+            export BASE_URL="http://$ALB_DNS"
+            
+            # Run smoke tests
+            python -m pytest tests/smoke/ -v --html=smoke-test-report.html --self-contained-html
+            
+            echo "🎉 Smoke tests completed!"
+          else
+            echo "ALB DNS not found, skipping smoke tests"
+          fi
+          
+      - name: Upload smoke test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: smoke-test-results-${{ needs.pre-deployment.outputs.deploy_version }}
+          path: smoke-test-report.html
+
+  # Job 8: Deployment Notification
+  deployment-notification:
+    name: Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, wait-for-deployment, health-check, smoke-tests]
+    if: always()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Generate deployment report
+        run: |
+          # Get ALB DNS
+          cd terraform
+          terraform init -backend=false
+          ALB_DNS=$(terraform output -raw load_balancer_dns || echo "")
+          cd ..
+          
+          echo "## 🚀 Staging Deployment Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Details:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.pre-deployment.outputs.deploy_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployed by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deploy time**: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "$ALB_DNS" ]; then
+            echo "### 🌐 Service URLs:" >> $GITHUB_STEP_SUMMARY
+            echo "- **Load Balancer**: http://$ALB_DNS" >> $GITHUB_STEP_SUMMARY
+            echo "- **API Gateway**: http://$ALB_DNS/" >> $GITHUB_STEP_SUMMARY
+            echo "- **User Service**: http://$ALB_DNS/users/" >> $GITHUB_STEP_SUMMARY
+            echo "- **Product Service**: http://$ALB_DNS/products/" >> $GITHUB_STEP_SUMMARY
+            echo "- **Order Service**: http://$ALB_DNS/orders/" >> $GITHUB_STEP_SUMMARY
+            echo "- **Notification Service**: http://$ALB_DNS/notifications/" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "### 📊 Job Status:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Database Migration**: ${{ needs.database-migration.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Infrastructure**: ${{ needs.deploy-infrastructure.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Services**: ${{ needs.deploy-services.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Health Check**: ${{ needs.health-check.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Smoke Tests**: ${{ needs.smoke-tests.result }}" >> $GITHUB_STEP_SUMMARY
+          
+      - name: Post to Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#deployments'
+          title: 'Staging Deployment'
+          message: |
+            *Staging Deployment ${{ job.status }}*
+            Version: ${{ needs.pre-deployment.outputs.deploy_version }}
+            Commit: ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+            Actor: ${{ github.actor }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }} 

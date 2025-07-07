@@ -1,0 +1,80 @@
+# General Configuration
+aws_region   = "us-east-1"
+project_name = "django-microservices"
+environment  = "dev"
+
+# VPC Configuration
+vpc_cidr           = "10.0.0.0/16"
+availability_zones = 2
+
+# NAT Gateway Configuration (Cost Optimization)
+enable_nat_gateway = true
+single_nat_gateway = true  # Set to false for production HA
+
+# Database Configuration
+database_instance_class        = "db.t3.micro"
+database_allocated_storage     = 20
+database_max_allocated_storage = 100
+database_backup_retention_period = 7
+database_multi_az             = false  # Set to true for production
+database_deletion_protection  = false  # Set to true for production
+
+# Redis Configuration
+redis_node_type       = "cache.t3.micro"
+redis_num_cache_nodes = 1
+
+# ECS Configuration
+ecs_task_cpu                = 256
+ecs_task_memory             = 512
+ecs_service_desired_count   = 1
+
+# Load Balancer Configuration
+enable_deletion_protection = false  # Set to true for production
+
+# CloudWatch Configuration
+log_retention_in_days = 7  # Options: 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653
+
+# Security Configuration
+allowed_cidr_blocks = ["0.0.0.0/0"]  # Restrict this for production
+
+# ECR Configuration
+ecr_image_tag_mutability = "MUTABLE"    # Options: MUTABLE, IMMUTABLE
+ecr_scan_on_push        = true
+
+# Microservices Configuration
+microservices = [
+  "api-gateway",
+  "user-service",
+  "product-service",
+  "order-service",
+  "notification-service"
+]
+
+microservice_ports = {
+  "api-gateway"         = 8000
+  "user-service"        = 8001
+  "product-service"     = 8002
+  "order-service"       = 8003
+  "notification-service" = 8004
+}
+
+# Additional Tags
+additional_tags = {
+  # Owner       = "development-team"
+  # CostCenter  = "engineering"
+  # Department  = "technology"
+}
+
+# Production Values (uncomment and modify for production use)
+# environment = "prod"
+# database_instance_class = "db.t3.small"
+# database_multi_az = true
+# database_deletion_protection = true
+# single_nat_gateway = false
+# enable_deletion_protection = true
+# log_retention_in_days = 30
+# allowed_cidr_blocks = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+# ecr_image_tag_mutability = "IMMUTABLE"
+# ecs_task_cpu = 512
+# ecs_task_memory = 1024
+# ecs_service_desired_count = 2 
