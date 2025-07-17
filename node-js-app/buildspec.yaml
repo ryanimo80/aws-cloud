@@ -26,5 +26,6 @@ phases:
       - echo Pushing the Docker image...
       - docker push $IMAGE
       - echo Image pushed: $IMAGE
+
 artifacts:
   files: []
