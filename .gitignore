@@ -10,3 +10,5 @@ terraform.tfstate.backup
 .env.local
 .env.development.local
 .env.test.local
+node-js-app/node_modules
+node_modules
